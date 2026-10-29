@@ -1,5 +1,14 @@
 # Changelog
 
+## 1.0.1
+
+- Security hardening: the OpenRGB server is started on loopback only; the Python dependency is
+  installed by exact hash; paths are quoted in the generated hook and systemd units (a path with
+  shell metacharacters could previously run code); `setup` and `uninstall` no longer overwrite or
+  delete files they didn't create (such as an existing `openrgb-server.service`); malformed
+  `runtime.json` no longer crashes the CLI; CI runs with read-only permissions.
+- Added SECURITY.md and security tests.
+
 ## 1.0.0
 
 - Bar widget and panel for ARGB/RGB control of everything OpenRGB can see

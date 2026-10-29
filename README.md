@@ -105,6 +105,13 @@ The panel's settings page shows the same results.
 - **Another RGB program is running** (OpenRGB GUI, SignalRGB, vendor tools) and fighting
   over the same devices. Close it.
 
+## Security
+
+Prism runs as your user and never listens on the network. OpenRGB's SDK has no
+authentication, so Prism starts it bound to `127.0.0.1`; the Python dependency is pinned by
+hash; and `setup`/`uninstall` only touch files they created. Details and how to report a
+problem are in [SECURITY.md](SECURITY.md).
+
 ## Uninstall
 
 ```bash

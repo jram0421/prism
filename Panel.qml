@@ -149,7 +149,7 @@ Panel {
   }
 
   function launchSetup() {
-    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", root.script + " setup"])
+    Quickshell.execDetached(["omarchy-launch-floating-terminal-with-presentation", Util.shellQuote(root.script) + " setup"])
   }
 
   function parseStatus(raw) {

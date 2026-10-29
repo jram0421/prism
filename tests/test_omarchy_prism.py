@@ -315,5 +315,164 @@ class RepoTests(unittest.TestCase):
             self.assertNotIn("/home/", path.read_text(), path.name)
 
 
+class SecurityTests(IsolatedConfig):
+    """Hostile paths, other people's files, and untrusted input."""
+
+    EVIL = 'plug "$(touch PWNED)" `touch PWNED2` $HOME in'
+
+    def evil_script(self):
+        root = Path(self.tmp.name) / self.EVIL / "bin"
+        root.mkdir(parents=True)
+        script = root / "omarchy-prism"
+        script.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > "$(dirname "$0")/../args"\n')
+        script.chmod(0o755)
+        return script
+
+    def test_hook_does_not_execute_shell_metacharacters_in_the_path(self):
+        import subprocess
+        script = self.evil_script()
+        hook = Path(self.tmp.name) / "hook.sh"
+        hook.write_text(prism.render_hook(script))
+        subprocess.run(["bash", str(hook), "gruvbox"], cwd=self.tmp.name, check=True)
+        self.assertFalse((Path(self.tmp.name) / "PWNED").exists())
+        self.assertFalse((Path(self.tmp.name) / "PWNED2").exists())
+        # ...and the real script was still called with the right arguments.
+        args = (script.parent.parent / "args").read_text().split()
+        self.assertEqual(args, ["theme-hook", "gruvbox"])
+
+    def test_unit_quote_survives_spaces_and_blocks_expansion(self):
+        self.assertEqual(prism.unit_quote("/a b/c"), '"/a b/c"')
+        self.assertEqual(prism.unit_quote("/100%/x"), '"/100%%/x"')
+        self.assertEqual(prism.unit_quote("/$HOME/x"), '"/$$HOME/x"')
+        self.assertEqual(prism.unit_quote('/q"q/x'), '"/q\\"q/x"')
+
+    def test_rendered_units_quote_paths_and_carry_the_marker(self):
+        engine = prism.render_engine_unit("/py thon/bin/python", "/odd %dir/bin/omarchy-prism")
+        self.assertIn(prism.MANAGED, engine)
+        self.assertIn('ExecStart="/py thon/bin/python" "/odd %%dir/bin/omarchy-prism" engine', engine)
+        server = prism.render_server_unit("/usr/bin/openrgb", True)
+        self.assertIn(prism.MANAGED, server)
+        self.assertIn('--server --server-host 127.0.0.1 --noautoconnect', server)
+
+    def test_server_binds_to_loopback_only_when_supported(self):
+        self.assertNotIn("--server-host", prism.render_server_unit("/usr/bin/openrgb", False))
+
+    def test_units_pass_systemd_analyze_when_available(self):
+        import shutil, subprocess
+        if not shutil.which("systemd-analyze"):
+            self.skipTest("systemd-analyze not available")
+        d = Path(self.tmp.name) / "units"
+        d.mkdir()
+        (d / "omarchy-prism.service").write_text(prism.render_engine_unit("/bin/true", "/bin/true"))
+        r = subprocess.run(["systemd-analyze", "--user", "verify", str(d / "omarchy-prism.service")],
+                           capture_output=True, text=True)
+        self.assertNotIn("Invalid", r.stderr)
+
+    def test_is_ours_never_claims_foreign_files(self):
+        d = Path(self.tmp.name)
+        self.assertTrue(prism.is_ours(d / "absent"))
+        mine = d / "mine"; mine.write_text(prism.MANAGED + "\n[Unit]\n")
+        theirs = d / "theirs"; theirs.write_text("[Unit]\nDescription=my own openrgb server\n")
+        link = d / "link"; link.symlink_to("/somewhere/else/other-tool")
+        self.assertTrue(prism.is_ours(mine))
+        self.assertFalse(prism.is_ours(theirs))
+        self.assertFalse(prism.is_ours(link))
+        pre = d / "pre"; pre.write_text("[Unit]\n" + prism.SERVER_UNIT_V0 + "\nExecStart=/usr/bin/openrgb --server\n")
+        self.assertTrue(prism.is_ours(pre, (prism.MANAGED, prism.SERVER_UNIT_V0)))
+
+    def test_uninstall_leaves_a_users_own_server_unit_alone(self):
+        units = Path(self.tmp.name) / "units"; units.mkdir()
+        saved = (prism.SYSTEMD_USER_DIR, prism.HOOK_FILE, prism.BIN_LINK, prism.systemctl)
+        self.addCleanup(lambda: [setattr(prism, n, v) for n, v in zip(("SYSTEMD_USER_DIR", "HOOK_FILE", "BIN_LINK", "systemctl"), saved)])
+        prism.SYSTEMD_USER_DIR = units
+        prism.HOOK_FILE = Path(self.tmp.name) / "hook"
+        prism.BIN_LINK = Path(self.tmp.name) / "bin"
+        prism.systemctl = lambda *a, **k: None
+        (units / prism.SERVER_UNIT).write_text("[Service]\nExecStart=/usr/bin/openrgb --server --my-flags\n")
+        (units / prism.ENGINE_UNIT).write_text(prism.render_engine_unit("/p", "/s"))
+        prism.HOOK_FILE.write_text("#!/bin/bash\necho a different tool's hook\n")
+        with contextlib.redirect_stdout(io.StringIO()):
+            prism.cmd_uninstall(type("A", (), {"purge": False})())
+        self.assertTrue((units / prism.SERVER_UNIT).exists(), "user's own server unit was deleted")
+        self.assertFalse((units / prism.ENGINE_UNIT).exists())
+        self.assertTrue(prism.HOOK_FILE.exists(), "someone else's hook was deleted")
+
+    def test_library_install_is_hash_pinned(self):
+        import re
+        self.assertRegex(prism.OPENRGB_LIB_SHA256, r"^[0-9a-f]{64}$")
+        calls = []
+        real = prism.subprocess.run
+        prism.subprocess.run = lambda cmd, **k: calls.append(cmd) or type("R", (), {"returncode": 0})()
+        self.addCleanup(lambda: setattr(prism.subprocess, "run", real))
+        self.assertTrue(prism.install_hashed_library("/venv/bin/python"))
+        cmd = calls[0]
+        for flag in ("--require-hashes", "--no-deps", "--only-binary=:all:"):
+            self.assertIn(flag, cmd)
+
+    def test_sanitize_never_raises_on_hostile_json(self):
+        import random
+        rng = random.Random(1234)
+        atoms = [None, True, False, 0, -1, 10**30, 1.5, "", "x" * 5000, "../../etc/passwd", "\x00", [], {}, [1], {"a": 1}]
+        keys = ["power", "mode", "color", "brightness", "speed", "follow_theme", "auto_off", "zones", "extra"]
+        for _ in range(500):
+            raw = {k: rng.choice(atoms) for k in rng.sample(keys, rng.randint(0, len(keys)))}
+            cfg = prism.sanitize(raw)
+            self.assertIn(cfg["mode"], prism.MODES)
+            self.assertRegex(cfg["color"], r"^[0-9a-f]{6}$")
+            self.assertTrue(0 <= cfg["brightness"] <= 100 and 0 <= cfg["speed"] <= 100)
+        for top in (None, 5, "str", [1, 2]):
+            self.assertEqual(prism.sanitize(top), prism.DEFAULTS)
+
+    def test_cli_rejects_hostile_arguments_without_tracebacks(self):
+        self.write_runtime(ZoneTests.DEVICES)
+        hostile = [
+            ("color", "$(touch PWNED)"), ("color", "; rm -rf ~"), ("color", "../../x"), ("color", "\x00"),
+            ("mode", "Rainbow; reboot"), ("brightness", "1e3"), ("brightness", "-5"), ("speed", "٣"),
+            ("zone", "../../etc", "5"), ("zone", "header 1", "-1"), ("zone", "header 1", "9" * 400),
+            ("auto-off", "lock", "maybe"), ("follow", "perhaps"),
+        ]
+        for args in hostile:
+            try:
+                code, _, err = self.cli(*args)
+            except Exception as e:  # noqa: BLE001 - any raised exception is a failure
+                self.fail(f"{args} raised {type(e).__name__}: {e}")
+            self.assertNotIn("Traceback", err, args)
+        self.assertFalse((Path.cwd() / "PWNED").exists())
+
+    def test_runtime_file_with_wrong_types_does_not_crash_the_cli(self):
+        for payload in ('{"devices": "nope"}', '{"devices": [1, 2]}', '{"devices": [{"zones": "x"}]}', "[]", "garbage"):
+            argb_runtime = prism.RUNTIME_FILE
+            prism.write_atomic(argb_runtime, payload)
+            for args in (("devices",), ("zone", "header 1", "5"), ("status", "--json")):
+                try:
+                    self.cli(*args)
+                except Exception as e:  # noqa: BLE001
+                    self.fail(f"{payload!r} / {args} raised {type(e).__name__}: {e}")
+
+    def test_panel_quotes_the_script_path_for_the_terminal_launcher(self):
+        panel = (ROOT / "Panel.qml").read_text()
+        self.assertIn('Util.shellQuote(root.script) + " setup"', panel)
+        self.assertNotIn('root.script + " setup"', panel)
+
+    def test_every_dynamic_text_in_the_panel_is_plain_text(self):
+        import re
+        s = (ROOT / "Panel.qml").read_text()
+        for m in re.finditer(r"\bText\s*\{", s):
+            depth, j = 0, m.end() - 1
+            while True:
+                depth += (s[j] == "{") - (s[j] == "}")
+                if depth == 0:
+                    break
+                j += 1
+            block = s[m.start():j + 1]
+            tm = re.search(r"\btext:\s*(.+)", block)
+            if tm and not re.fullmatch(r'"[^"]*"', tm.group(1).strip()):
+                self.assertIn("textFormat", block, f"line {s[:m.start()].count(chr(10)) + 1}: {tm.group(1)[:60]}")
+
+    def test_ci_runs_with_least_privilege(self):
+        ci = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertIn("permissions:\n  contents: read", ci)
+
+
 if __name__ == "__main__":
     unittest.main()

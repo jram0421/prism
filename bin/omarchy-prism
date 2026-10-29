@@ -19,6 +19,7 @@ import json
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -28,8 +29,15 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 OPENRGB_LIB = "openrgb-python==0.3.8"
+# Pure-Python wheel with no dependencies; the hash is the digest PyPI publishes for it.
+OPENRGB_LIB_SHA256 = "6e61a92a2119c7cdab4e615302a0707cd8d8f12e3f001067a6b5fae0c5e7e7b2"
+# Written into everything setup creates, so we never overwrite or remove files
+# that belong to someone else (e.g. a user's own openrgb-server.service).
+MANAGED = "# Managed by omarchy-prism"
+# The server unit as written before the marker existed (1.0.0 development builds).
+SERVER_UNIT_V0 = "Description=OpenRGB SDK server\n\n[Service]"
 
 HOME = Path.home()
 SCRIPT = Path(__file__).resolve()
@@ -210,10 +218,36 @@ def theme_accent():
     return boost_contrast(m.group(1).lower()) if m else ""
 
 
+def is_int(value):
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def clean_runtime(data):
+    """Rebuild the engine's runtime snapshot from known-good fields only."""
+    if not isinstance(data, dict):
+        return {}
+    out = {
+        "connected": data.get("connected") is True,
+        "error": data["error"] if isinstance(data.get("error"), str) else "",
+        "suppressed": data["suppressed"] if data.get("suppressed") in ("locked", "screensaver") else "",
+        "devices": [],
+    }
+    for dev in data["devices"] if isinstance(data.get("devices"), list) else []:
+        if not isinstance(dev, dict):
+            continue
+        zones = []
+        for z in dev["zones"] if isinstance(dev.get("zones"), list) else []:
+            if isinstance(z, dict) and isinstance(z.get("key"), str) and all(is_int(z.get(k)) for k in ("leds", "min", "max")):
+                zones.append({"key": z["key"], "name": str(z.get("name", "")), "leds": z["leds"],
+                              "min": z["min"], "max": z["max"], "resizable": z.get("resizable") is True})
+        out["devices"].append({"name": str(dev.get("name", "?")), "type": str(dev.get("type", "?")),
+                               "leds": dev["leds"] if is_int(dev.get("leds")) else 0, "zones": zones})
+    return out
+
+
 def read_runtime():
     try:
-        data = json.loads(RUNTIME_FILE.read_text())
-        return data if isinstance(data, dict) else {}
+        return clean_runtime(json.loads(RUNTIME_FILE.read_text()))
     except (OSError, ValueError):
         return {}
 
@@ -561,6 +595,62 @@ def systemctl(*args, check=True):
     return r
 
 
+def is_ours(path, markers=(MANAGED,)):
+    """True if `path` is absent, or something this tool created (marked file/symlink)."""
+    try:
+        if path.is_symlink():
+            content = os.readlink(path)
+        elif path.exists():
+            content = path.read_text(errors="replace")
+        else:
+            return True
+    except OSError:
+        return False
+    return any(m in content for m in markers)
+
+
+def unit_quote(value):
+    """Quote one systemd ExecStart word: spaces survive, and %/$ aren't expanded."""
+    value = str(value).replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%").replace("$", "$$")
+    return f'"{value}"'
+
+
+def supports_server_host(openrgb):
+    r = run([str(openrgb), "--help"], timeout=5)
+    return bool(r and "--server-host" in (r.stdout + r.stderr))
+
+
+def render_server_unit(openrgb, bind_local):
+    # Bind to loopback explicitly where supported: the SDK has no authentication.
+    flags = " --server-host 127.0.0.1" if bind_local else ""
+    return (f"{MANAGED}\n[Unit]\nDescription=OpenRGB SDK server\n\n"
+            f"[Service]\nExecStart={unit_quote(openrgb)} --server{flags} --noautoconnect\n"
+            "Restart=on-failure\n\n[Install]\nWantedBy=default.target\n")
+
+
+def render_engine_unit(py, script):
+    return (f"{MANAGED}\n[Unit]\nDescription=omarchy-prism lighting engine\n"
+            f"After={SERVER_UNIT}\nWants={SERVER_UNIT}\n\n"
+            f"[Service]\nExecStart={unit_quote(py)} {unit_quote(script)} engine\n"
+            "Restart=always\nRestartSec=2\nRestartPreventExitStatus=78\n\n"
+            "[Install]\nWantedBy=default.target\n")
+
+
+def render_hook(script):
+    return ("#!/bin/bash\n" + MANAGED + "\n\n"
+            "# Recolor ARGB lighting to the new theme's accent (only when \"Match theme\" is on).\n"
+            f"exec {shlex.quote(str(script))} theme-hook \"$@\"\n")
+
+
+def install_hashed_library(py):
+    """pip install the pinned library, refusing anything whose hash differs."""
+    with tempfile.NamedTemporaryFile("w", suffix=".txt") as reqs:
+        reqs.write(f"{OPENRGB_LIB} --hash=sha256:{OPENRGB_LIB_SHA256}\n")
+        reqs.flush()
+        return subprocess.run([str(py), "-m", "pip", "install", "-q", "--no-deps", "--only-binary=:all:",
+                               "--require-hashes", "-r", reqs.name]).returncode == 0
+
+
 def write_file(path, text, mode=None):
     if path.is_symlink() or path.exists():
         path.unlink()  # never write through a stale symlink
@@ -585,43 +675,41 @@ def cmd_setup(_args):
     if not (py.exists() and subprocess.run([str(py), "-c", "import openrgb"], capture_output=True).returncode == 0):
         print("Creating Python environment...")
         subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
-        r = subprocess.run([str(py), "-m", "pip", "install", "-q", OPENRGB_LIB])
-        if r.returncode != 0:
-            raise UserError(f"pip could not install {OPENRGB_LIB}")
+        if not install_hashed_library(py):
+            raise UserError(f"pip could not install {OPENRGB_LIB} (hash-pinned; see the output above)")
 
+    old = ("omarchy-argb", "argb-engine")  # markers of pre-release files
     for legacy in LEGACY_UNITS:
-        systemctl("disable", "--now", legacy, check=False)
         p = SYSTEMD_USER_DIR / legacy
-        if p.is_symlink() or p.exists():
+        if (p.is_symlink() or p.exists()) and is_ours(p, old):
+            systemctl("disable", "--now", legacy, check=False)
             p.unlink()
     for p in (LEGACY_HOOK, LEGACY_BIN_LINK):
-        if p.is_symlink() or p.exists():
+        if (p.is_symlink() or p.exists()) and is_ours(p, old):
             p.unlink()
     legacy_cfg = LEGACY_CONFIG_DIR / "config.json"
     if legacy_cfg.exists() and not CONFIG_FILE.exists():
         write_atomic(CONFIG_FILE, legacy_cfg.read_text())
         print("Migrated settings from the pre-release omarchy-argb.")
 
-    write_file(SYSTEMD_USER_DIR / SERVER_UNIT, (
-        "[Unit]\nDescription=OpenRGB SDK server\n\n"
-        f"[Service]\nExecStart={openrgb} --server --noautoconnect\nRestart=on-failure\n\n"
-        "[Install]\nWantedBy=default.target\n"))
-    write_file(SYSTEMD_USER_DIR / ENGINE_UNIT, (
-        "[Unit]\nDescription=omarchy-prism lighting engine\n"
-        f"After={SERVER_UNIT}\nWants={SERVER_UNIT}\n\n"
-        f"[Service]\nExecStart={py} {SCRIPT} engine\nRestart=always\nRestartSec=2\n"
-        "RestartPreventExitStatus=78\n\n"
-        "[Install]\nWantedBy=default.target\n"))
+    server_unit = SYSTEMD_USER_DIR / SERVER_UNIT
+    if is_ours(server_unit, (MANAGED, SERVER_UNIT_V0)):
+        write_file(server_unit, render_server_unit(openrgb, supports_server_host(openrgb)))
+    else:
+        print(f"note: keeping your existing {SERVER_UNIT} (not created by Prism). "
+              "Make sure it runs `openrgb --server` and listens on 127.0.0.1 only; the SDK has no authentication.")
+    write_file(SYSTEMD_USER_DIR / ENGINE_UNIT, render_engine_unit(py, SCRIPT))
 
-    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
-    if BIN_LINK.is_symlink() or BIN_LINK.exists():
-        BIN_LINK.unlink()
-    BIN_LINK.symlink_to(SCRIPT)
-
-    write_file(HOOK_FILE, (
-        "#!/bin/bash\n\n"
-        "# Recolor ARGB lighting to the new theme's accent (only when \"Match theme\" is on).\n"
-        f"exec \"{SCRIPT}\" theme-hook \"$@\"\n"), mode=0o755)
+    for path, what in ((BIN_LINK, "CLI link"), (HOOK_FILE, "theme hook")):
+        if not is_ours(path, (MANAGED, "omarchy-prism")):
+            print(f"note: {path} already exists and isn't Prism's; leaving the {what} alone.")
+    if is_ours(BIN_LINK, (MANAGED, "omarchy-prism")):
+        BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+        if BIN_LINK.is_symlink() or BIN_LINK.exists():
+            BIN_LINK.unlink()
+        BIN_LINK.symlink_to(SCRIPT)
+    if is_ours(HOOK_FILE, (MANAGED, "omarchy-prism")):
+        write_file(HOOK_FILE, render_hook(SCRIPT), mode=0o755)
 
     systemctl("daemon-reload")
     systemctl("enable", SERVER_UNIT, ENGINE_UNIT)
@@ -636,13 +724,17 @@ def cmd_setup(_args):
 
 def cmd_uninstall(args):
     for unit in (ENGINE_UNIT, SERVER_UNIT, *LEGACY_UNITS):
-        systemctl("disable", "--now", unit, check=False)
         p = SYSTEMD_USER_DIR / unit
-        if p.is_symlink() or p.exists():
-            p.unlink()
+        if not (p.is_symlink() or p.exists()):
+            continue
+        if not is_ours(p, (MANAGED, SERVER_UNIT_V0, "omarchy-argb", "argb-engine")):
+            print(f"leaving {unit}: it isn't Prism's")
+            continue
+        systemctl("disable", "--now", unit, check=False)
+        p.unlink()
     systemctl("daemon-reload", check=False)
     for p in (HOOK_FILE, BIN_LINK):
-        if p.is_symlink() or p.exists():
+        if (p.is_symlink() or p.exists()) and is_ours(p, (MANAGED, "omarchy-prism")):
             p.unlink()
     if args.purge:
         for d in (CONFIG_DIR, STATE_DIR, DATA_DIR):
