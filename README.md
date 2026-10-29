@@ -120,6 +120,12 @@ omarchy-prism uninstall --purge   # also deletes settings and the Python environ
 omarchy plugin remove jram0421.prism
 ```
 
+Run `uninstall` first: `omarchy plugin remove` only deletes the plugin folder and can't stop
+services. If you forget, the leftover hook and service are harmless no-ops; run
+`systemctl --user disable --now omarchy-prism.service` and delete
+`~/.config/omarchy/hooks/theme-set.d/prism-sync` to clean up. The OpenRGB server keeps running
+until you stop it (`systemctl --user disable --now openrgb-server.service`).
+
 ## Development
 
 The plugin is a QML panel (`Panel.qml`) plus one Python program (`bin/omarchy-prism`,

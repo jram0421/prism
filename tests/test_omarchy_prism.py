@@ -340,6 +340,16 @@ class SecurityTests(IsolatedConfig):
         args = (script.parent.parent / "args").read_text().split()
         self.assertEqual(args, ["theme-hook", "gruvbox"])
 
+    def test_hook_and_unit_are_harmless_if_the_plugin_is_removed_without_uninstall(self):
+        import subprocess
+        gone = Path(self.tmp.name) / "removed" / "omarchy-prism"   # never created
+        hook = Path(self.tmp.name) / "hook.sh"
+        hook.write_text(prism.render_hook(gone))
+        r = subprocess.run(["bash", str(hook), "gruvbox"], capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        unit = prism.render_engine_unit("/py", "/odd %dir/omarchy-prism")
+        self.assertIn("ConditionPathExists=/odd %%dir/omarchy-prism", unit)
+
     def test_unit_quote_survives_spaces_and_blocks_expansion(self):
         self.assertEqual(prism.unit_quote("/a b/c"), '"/a b/c"')
         self.assertEqual(prism.unit_quote("/100%/x"), '"/100%%/x"')

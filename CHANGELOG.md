@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.0.2
+
+- Safe removal: if the plugin is removed with `omarchy plugin remove` without running
+  `omarchy-prism uninstall` first, the theme hook and lighting service now do nothing instead of
+  erroring on every theme change or restart-looping.
+- Added a preview image.
+
 ## 1.0.1
 
 - Security hardening: the OpenRGB server is started on loopback only; the Python dependency is
