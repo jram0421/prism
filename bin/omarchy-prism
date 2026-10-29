@@ -1,0 +1,877 @@
+#!/usr/bin/env python3
+"""omarchy-prism: motherboard / RAM / strip ARGB lighting for Omarchy, via OpenRGB.
+
+One program, three roles:
+
+  CLI      `omarchy-prism color red`, `mode Rainbow`, `zone "Header 1" 24`, ...
+           Edits ~/.config/omarchy-prism/config.json. Needs only the stdlib.
+  engine   `omarchy-prism engine`, run by the omarchy-prism.service user unit.
+           Connects to the OpenRGB server and drives every LED from a single
+           clock, so effects stay in lockstep across all devices. It also
+           handles Static/Off (and fades), so lights are restored after login,
+           resume or an OpenRGB restart. Needs the `openrgb-python` library.
+  setup    `omarchy-prism setup` / `doctor` / `uninstall`.
+"""
+import argparse
+import colorsys
+import fcntl
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+from pathlib import Path
+
+VERSION = "1.0.0"
+OPENRGB_LIB = "openrgb-python==0.3.8"
+
+HOME = Path.home()
+SCRIPT = Path(__file__).resolve()
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy-prism"
+STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy-prism"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME", HOME / ".local/share")) / "omarchy-prism"
+OMARCHY_STATE = Path(os.environ.get("XDG_STATE_HOME", HOME / ".local/state")) / "omarchy"
+SYSTEMD_USER_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "systemd/user"
+HOOK_DIR = HOME / ".config/omarchy/hooks/theme-set.d"
+
+CONFIG_FILE = CONFIG_DIR / "config.json"
+RUNTIME_FILE = STATE_DIR / "runtime.json"
+THEME_COLORS = OMARCHY_STATE / "current/theme/colors.toml"
+VENV = DATA_DIR / "venv"
+BIN_LINK = HOME / ".local/bin/omarchy-prism"
+HOOK_FILE = HOOK_DIR / "prism-sync"
+
+SERVER_UNIT = "openrgb-server.service"
+ENGINE_UNIT = "omarchy-prism.service"
+# Names used by pre-release builds (omarchy-argb); setup cleans these up.
+LEGACY_UNITS = ["argb-engine.service", "omarchy-argb.service"]
+LEGACY_HOOK = HOOK_DIR / "argb-sync"
+LEGACY_BIN_LINK = HOME / ".local/bin/omarchy-argb"
+LEGACY_CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", HOME / ".config")) / "omarchy-argb"
+OPENRGB_HOST, OPENRGB_PORT = "127.0.0.1", 6742
+
+MODES = ["Static", "Breathing", "Flashing", "Spectrum Cycle", "Rainbow", "Wave"]
+# Effects that pick their own colors; choosing a plain color leaves them.
+SELF_COLORED = ("Rainbow", "Spectrum Cycle")
+NAMED_COLORS = {
+    "white": "ffffff", "red": "ff0000", "orange": "ff6a00", "yellow": "ffd000",
+    "green": "00ff40", "cyan": "00e5ff", "blue": "0040ff", "purple": "9d00ff",
+    "pink": "ff2a9d",
+}
+
+DEFAULTS = {
+    "power": True,
+    "mode": "Static",
+    "color": "ffffff",
+    "brightness": 100,
+    "speed": 50,
+    "follow_theme": False,
+    "auto_off": {"lock": False, "screensaver": False},
+    "zones": {},
+}
+
+FPS = 30
+# Theme accents are pastel UI colors that wash out on LEDs; push them harder.
+ACCENT_CONTRAST = 1.5
+FADE_RATE = 9.0  # per second; higher fades faster
+
+
+# --------------------------------------------------------------------------
+# Config
+# --------------------------------------------------------------------------
+
+class UserError(Exception):
+    """A problem to report to the user without a traceback."""
+
+
+def normalize_hex(value):
+    """'#F00', 'ff0000' or a color name -> 'ff0000'. Raises UserError."""
+    s = str(value).strip().lower().lstrip("#")
+    s = NAMED_COLORS.get(s, s)
+    if re.fullmatch(r"[0-9a-f]{3}", s):
+        s = "".join(c * 2 for c in s)
+    if not re.fullmatch(r"[0-9a-f]{6}", s):
+        raise UserError(f"invalid color '{value}' (use hex like ff2a9d, a name, or 'theme')")
+    return s
+
+
+def normalize_mode(value):
+    key = re.sub(r"[\s_-]+", " ", str(value)).strip().lower()
+    for mode in MODES:
+        if mode.lower() == key:
+            return mode
+    raise UserError(f"unknown mode '{value}' (choose from: {', '.join(MODES)})")
+
+
+def clamp(value, low, high):
+    return max(low, min(high, value))
+
+
+def sanitize(raw):
+    """Merge a loaded config over the defaults, discarding invalid values."""
+    cfg = json.loads(json.dumps(DEFAULTS))
+    if not isinstance(raw, dict):
+        return cfg
+    for key in ("power", "follow_theme"):
+        if isinstance(raw.get(key), bool):
+            cfg[key] = raw[key]
+    for key in ("brightness", "speed"):
+        if isinstance(raw.get(key), (int, float)) and not isinstance(raw.get(key), bool):
+            cfg[key] = int(clamp(raw[key], 0, 100))
+    try:
+        cfg["mode"] = normalize_mode(raw.get("mode", cfg["mode"]))
+        cfg["color"] = normalize_hex(raw.get("color", cfg["color"]))
+    except UserError:
+        pass
+    auto = raw.get("auto_off")
+    if isinstance(auto, dict):
+        for key in cfg["auto_off"]:
+            if isinstance(auto.get(key), bool):
+                cfg["auto_off"][key] = auto[key]
+    zones = raw.get("zones")
+    if isinstance(zones, dict):
+        cfg["zones"] = {str(k): int(v) for k, v in zones.items()
+                        if isinstance(v, int) and not isinstance(v, bool) and v >= 0}
+    return cfg
+
+
+def load_config():
+    try:
+        return sanitize(json.loads(CONFIG_FILE.read_text()))
+    except (OSError, ValueError):
+        return sanitize(None)
+
+
+def write_atomic(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def update_config(mutate):
+    """Locked read-modify-write, so panel, hook and CLI can't clobber each other."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(CONFIG_DIR / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        cfg = load_config()
+        mutate(cfg)
+        cfg = sanitize(cfg)
+        write_atomic(CONFIG_FILE, json.dumps(cfg, indent=2) + "\n")
+    return cfg
+
+
+def led_hue(h):
+    """Pull green-to-cyan hues (0..1) toward pure green.
+
+    The blue diodes in RGB LEDs look far brighter than the green ones, so UI greens
+    with any blue in them (teal, mint, jade) read as blue-cyan on hardware. The
+    pull is strongest through the green-cyan range and fades to nothing by hue 220
+    degrees, so genuine blues stay blue.
+    """
+    deg = h * 360
+    d = deg - 120
+    if d <= 0 or d >= 100:
+        return h
+    pull = d * 0.5 if d <= 60 else 30 * (100 - d) / 40  # degrees moved toward green
+    return (deg - pull) / 360
+
+
+def boost_contrast(hexstr, factor=ACCENT_CONTRAST):
+    """Adjust a UI color to read well on LEDs: more saturation and brightness
+    (`factor`, capped at full) and greens kept from drifting toward blue."""
+    r, g, b = (int(hexstr[i:i + 2], 16) / 255 for i in (0, 2, 4))
+    h, sat, val = colorsys.rgb_to_hsv(r, g, b)
+    r, g, b = colorsys.hsv_to_rgb(led_hue(h), min(1.0, sat * factor), min(1.0, val * factor))
+    return "%02x%02x%02x" % (round(r * 255), round(g * 255), round(b * 255))
+
+
+def theme_accent():
+    """The theme's accent, adjusted to read well on LEDs ('' if there is no theme)."""
+    try:
+        text = THEME_COLORS.read_text()
+    except OSError:
+        return ""
+    m = re.search(r'^accent\s*=\s*"#?([0-9a-fA-F]{6})"', text, re.M)
+    return boost_contrast(m.group(1).lower()) if m else ""
+
+
+def read_runtime():
+    try:
+        data = json.loads(RUNTIME_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+# --------------------------------------------------------------------------
+# Effects (pure)
+# --------------------------------------------------------------------------
+
+def speed_factor(speed):
+    """0..100 -> time multiplier: 0 = 0.25x, 50 = 1x, 100 = 4x."""
+    return 2 ** ((speed - 50) / 25)
+
+
+def hsv(h, s=1.0, v=1.0):
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+    return (r * 255, g * 255, b * 255)
+
+
+def hex_to_rgb(hexstr):
+    return tuple(int(hexstr[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def frame(mode, t, pos, total, rgb):
+    """RGB (0-255 floats) for the LED at index `pos` of `total` along the chain."""
+    if mode == "Rainbow":  # one hue wheel spread over every LED, flowing
+        return hsv(t * 0.12 - pos / max(total, 1))
+    if mode == "Spectrum Cycle":  # every LED the same hue, drifting
+        return hsv(t * 0.08)
+    if mode == "Breathing":  # chosen color, pulsing together
+        k = 0.05 + 0.95 * (math.sin(t * 1.6 - math.pi / 2) + 1) / 2
+        return tuple(c * k for c in rgb)
+    if mode == "Flashing":  # chosen color, hard on/off together
+        return rgb if int(t * 4) % 2 == 0 else (0, 0, 0)
+    if mode == "Wave":  # chosen color, brightness wave travelling along the chain
+        k = 0.08 + 0.92 * (math.sin(t * 3.0 - pos * 0.35) + 1) / 2
+        return tuple(c * k for c in rgb)
+    return rgb  # Static
+
+
+# --------------------------------------------------------------------------
+# System probes
+# --------------------------------------------------------------------------
+
+def run(args, timeout=3):
+    try:
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def service_state(unit):
+    r = run(["systemctl", "--user", "is-active", unit])
+    return (r.stdout.strip() if r and r.stdout.strip() else "inactive")
+
+
+def screen_locked():
+    r = run(["omarchy-shell", "lock", "isLocked"], timeout=2)
+    return bool(r and r.stdout.strip() == "true")
+
+
+def screensaver_running():
+    r = run(["hyprctl", "clients", "-j"], timeout=2)
+    if not r or r.returncode != 0:
+        return False
+    try:
+        return any(c.get("class") == "org.omarchy.screensaver" for c in json.loads(r.stdout))
+    except ValueError:
+        return False
+
+
+# --------------------------------------------------------------------------
+# Engine
+# --------------------------------------------------------------------------
+
+class Engine:
+    def __init__(self):
+        self.running = True
+        self.suppressed = ""  # "", "locked" or "screensaver"
+        self.client = None
+
+    def log(self, msg):
+        print(msg, file=sys.stderr, flush=True)
+
+    # -- connection ---------------------------------------------------------
+
+    def import_lib(self):
+        try:
+            from openrgb import OpenRGBClient
+            from openrgb.utils import RGBColor
+        except ImportError:
+            self.log("the openrgb-python library is missing; run `omarchy-prism setup`")
+            sys.exit(78)  # EX_CONFIG: the unit declares this as no-restart
+        self.OpenRGBClient, self.RGBColor = OpenRGBClient, RGBColor
+
+    def connect(self):
+        """Connect, apply the configured zone sizes, and return the client."""
+        delay = 1.0
+        while self.running:
+            try:
+                client = self.OpenRGBClient(address=OPENRGB_HOST, port=OPENRGB_PORT, name="omarchy-prism")
+                if not client.devices:  # server is up but still scanning hardware
+                    client.disconnect()
+                    raise RuntimeError("OpenRGB has not detected any devices yet")
+                if self.apply_zone_sizes(client):  # sizes changed: re-read devices
+                    client.disconnect()
+                    client = self.OpenRGBClient(address=OPENRGB_HOST, port=OPENRGB_PORT, name="omarchy-prism")
+                for dev in client.devices:
+                    try:
+                        dev.set_mode("direct")
+                    except Exception:
+                        pass  # no Direct mode: set_colors may still work
+                self.publish(client, connected=True)
+                return client
+            except Exception as e:
+                self.publish(None, connected=False, error=str(e))
+                self.log(f"waiting for OpenRGB: {e}")
+                time.sleep(delay)
+                delay = min(delay * 2, 15.0)
+        return None
+
+    def apply_zone_sizes(self, client):
+        wanted = load_config()["zones"]
+        changed = False
+        for dev in client.devices:
+            for zone, data in zip(dev.zones, dev.data.zones):
+                if data.leds_min == data.leds_max:
+                    continue
+                size = wanted.get(f"{dev.name}/{zone.name}")
+                if size is None:
+                    continue
+                size = clamp(size, data.leds_min, data.leds_max)
+                if size != len(zone.leds):
+                    zone.resize(size)
+                    changed = True
+        return changed
+
+    def publish(self, client, connected, error=""):
+        devices = []
+        if client is not None:
+            for dev in client.devices:
+                zones = []
+                for zone, data in zip(dev.zones, dev.data.zones):
+                    zones.append({
+                        "key": f"{dev.name}/{zone.name}", "name": zone.name,
+                        "leds": len(zone.leds), "min": data.leds_min, "max": data.leds_max,
+                        "resizable": data.leds_min != data.leds_max,
+                    })
+                devices.append({"name": dev.name, "type": getattr(dev.type, "name", str(dev.type)),
+                                "leds": len(dev.leds), "zones": zones})
+        write_atomic(RUNTIME_FILE, json.dumps({
+            "pid": os.getpid(), "connected": connected, "error": error,
+            "suppressed": self.suppressed, "devices": devices, "updated": int(time.time()),
+        }, indent=2) + "\n")
+
+    # -- auto-off watcher ---------------------------------------------------
+
+    def watch_suppression(self):
+        while self.running:
+            auto = load_config()["auto_off"]
+            state = ""
+            if auto["lock"] and screen_locked():
+                state = "locked"
+            elif auto["screensaver"] and screensaver_running():
+                state = "screensaver"
+            self.suppressed = state
+            time.sleep(2)
+
+    # -- main loop ----------------------------------------------------------
+
+    def loop(self, client):
+        devices = client.devices
+        counts = [len(d.leds) for d in devices]
+        total = sum(counts)
+        cfg, mtime = load_config(), self.config_mtime()
+        applied_sizes = dict(cfg["zones"])
+        level, effect_t, last, last_write = 0.0, 0.0, time.monotonic(), 0.0
+        last_suppressed, last_publish = self.suppressed, time.monotonic()
+        last_poll = time.monotonic()
+        dirty = True
+
+        while self.running:
+            now = time.monotonic()
+            dt, last = min(now - last, 0.5), now
+
+            # The server finds hardware in stages (RAM, USB, ...) and replaces
+            # client.devices as it goes; ask now and then in case it didn't say so.
+            if now - last_poll >= 5:
+                last_poll = now
+                client.update()
+            live = client.devices
+            if len(live) != len(devices) and all(d is not None for d in live):
+                self.log(f"device list changed ({len(devices)} -> {len(live)}); reconnecting")
+                return
+
+            m = self.config_mtime()
+            if m != mtime:
+                mtime, cfg = m, load_config()
+                if cfg["zones"] != applied_sizes:
+                    return  # reconnect so the new LED counts take effect
+                dirty = True
+
+            target = 0.0 if (not cfg["power"] or self.suppressed) else cfg["brightness"] / 100
+            fading = abs(level - target) > 0.003
+            if fading:
+                level += (target - level) * (1 - math.exp(-dt * FADE_RATE))
+            else:
+                level = target
+            animated = cfg["mode"] != "Static" and level > 0
+            effect_t += dt * speed_factor(cfg["speed"])
+
+            if animated or fading or dirty or now - last_write >= 1.0:
+                rgb = hex_to_rgb(cfg["color"])
+                pos = 0
+                for dev, n in zip(devices, counts):
+                    cols = []
+                    for i in range(n):
+                        r, g, b = frame(cfg["mode"], effect_t, pos + i, total, rgb)
+                        cols.append(self.RGBColor(int(r * level), int(g * level), int(b * level)))
+                    dev.set_colors(cols, fast=True)
+                    pos += n
+                last_write, dirty = now, False
+
+            if self.suppressed != last_suppressed or now - last_publish > 10:
+                last_suppressed, last_publish = self.suppressed, now
+                self.publish(client, connected=True)
+
+            time.sleep(1 / FPS if (animated or fading) else 0.1)
+
+    @staticmethod
+    def config_mtime():
+        try:
+            return CONFIG_FILE.stat().st_mtime_ns
+        except OSError:
+            return 0
+
+    def stop(self, *_):
+        self.running = False
+
+    def run(self):
+        self.import_lib()
+        signal.signal(signal.SIGTERM, self.stop)
+        signal.signal(signal.SIGINT, self.stop)
+        threading.Thread(target=self.watch_suppression, daemon=True).start()
+        while self.running:
+            client = self.connect()
+            if client is None:
+                break
+            try:
+                self.loop(client)
+            except Exception as e:
+                self.log(f"lost OpenRGB connection: {e}")
+                self.publish(None, connected=False, error=str(e))
+                time.sleep(2)
+            try:
+                client.disconnect()
+            except Exception:
+                pass
+        self.publish(None, connected=False, error="stopped")
+
+
+# --------------------------------------------------------------------------
+# Status / doctor
+# --------------------------------------------------------------------------
+
+def build_status():
+    return {
+        "version": VERSION,
+        "config": load_config(),
+        "runtime": read_runtime(),
+        "installed": shutil.which("openrgb") is not None,
+        "server": service_state(SERVER_UNIT),
+        "engine": service_state(ENGINE_UNIT),
+        "accent": theme_accent(),
+        "modes": MODES,
+    }
+
+
+def doctor_checks():
+    """List of {name, status: ok|warn|fail, detail, fix}."""
+    checks = []
+
+    def add(name, status, detail="", fix=""):
+        checks.append({"name": name, "status": status, "detail": detail, "fix": fix})
+
+    openrgb = shutil.which("openrgb")
+    add("OpenRGB installed", "ok" if openrgb else "fail", openrgb or "not found in PATH",
+        "" if openrgb else "sudo pacman -S openrgb")
+
+    rules = [p for p in ("/usr/lib/udev/rules.d/60-openrgb.rules", "/etc/udev/rules.d/60-openrgb.rules")
+             if os.path.exists(p)]
+    add("OpenRGB udev rules", "ok" if rules else "warn",
+        rules[0] if rules else "USB devices may be inaccessible without the rules file",
+        "" if rules else "reinstall the openrgb package, or see openrgb.org for the udev rules")
+
+    i2c = list(Path("/dev").glob("i2c-*"))
+    add("I2C access (RAM, some boards)", "ok" if i2c else "warn",
+        f"{len(i2c)} bus(es)" if i2c else "no /dev/i2c-* devices; RAM lighting won't be detected",
+        "" if i2c else "echo i2c-dev | sudo tee /etc/modules-load.d/i2c-dev.conf && sudo modprobe i2c-dev")
+
+    py = VENV / "bin/python"
+    probe = run([str(py), "-c", "import openrgb"]) if py.exists() else None
+    lib_ok = bool(probe and probe.returncode == 0)
+    add("Python library", "ok" if lib_ok else "fail", str(py) if lib_ok else "openrgb-python not installed",
+        "" if lib_ok else "omarchy-prism setup")
+
+    units = all((SYSTEMD_USER_DIR / u).exists() for u in (SERVER_UNIT, ENGINE_UNIT))
+    add("Services installed", "ok" if units else "fail", "" if units else "systemd units missing",
+        "" if units else "omarchy-prism setup")
+
+    for label, unit in (("OpenRGB server running", SERVER_UNIT), ("Lighting engine running", ENGINE_UNIT)):
+        state = service_state(unit)
+        add(label, "ok" if state == "active" else "fail", state,
+            "" if state == "active" else f"systemctl --user restart {unit}  (or: omarchy-prism setup)")
+
+    rt = read_runtime()
+    if rt.get("connected"):
+        n = len(rt.get("devices", []))
+        add("Devices detected", "ok" if n else "warn", f"{n} device(s)",
+            "" if n else "OpenRGB sees no hardware; check the I2C / udev items above")
+    else:
+        add("Devices detected", "fail", rt.get("error") or "engine not connected", "journalctl --user -u omarchy-prism")
+
+    return checks
+
+
+def print_checks(checks):
+    marks = {"ok": "\033[32m✓\033[0m", "warn": "\033[33m!\033[0m", "fail": "\033[31m✗\033[0m"}
+    for c in checks:
+        line = f"{marks[c['status']]} {c['name']}"
+        if c["detail"]:
+            line += f" — {c['detail']}"
+        print(line)
+        if c["fix"] and c["status"] != "ok":
+            print(f"    fix: {c['fix']}")
+
+
+# --------------------------------------------------------------------------
+# Setup / uninstall
+# --------------------------------------------------------------------------
+
+def systemctl(*args, check=True):
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True)
+    if check and r.returncode != 0:
+        raise UserError(f"systemctl --user {' '.join(args)} failed: {r.stderr.strip()}")
+    return r
+
+
+def write_file(path, text, mode=None):
+    if path.is_symlink() or path.exists():
+        path.unlink()  # never write through a stale symlink
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+    if mode:
+        path.chmod(mode)
+
+
+def cmd_setup(_args):
+    openrgb = shutil.which("openrgb")
+    if not openrgb:
+        if shutil.which("omarchy-pkg-add"):
+            print("Installing OpenRGB (needs sudo)...")
+            if subprocess.run(["omarchy-pkg-add", "openrgb"]).returncode != 0:
+                raise UserError("could not install openrgb")
+            openrgb = shutil.which("openrgb")
+        if not openrgb:
+            raise UserError("OpenRGB is not installed: sudo pacman -S openrgb")
+
+    py = VENV / "bin/python"
+    if not (py.exists() and subprocess.run([str(py), "-c", "import openrgb"], capture_output=True).returncode == 0):
+        print("Creating Python environment...")
+        subprocess.run([sys.executable, "-m", "venv", str(VENV)], check=True)
+        r = subprocess.run([str(py), "-m", "pip", "install", "-q", OPENRGB_LIB])
+        if r.returncode != 0:
+            raise UserError(f"pip could not install {OPENRGB_LIB}")
+
+    for legacy in LEGACY_UNITS:
+        systemctl("disable", "--now", legacy, check=False)
+        p = SYSTEMD_USER_DIR / legacy
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    for p in (LEGACY_HOOK, LEGACY_BIN_LINK):
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    legacy_cfg = LEGACY_CONFIG_DIR / "config.json"
+    if legacy_cfg.exists() and not CONFIG_FILE.exists():
+        write_atomic(CONFIG_FILE, legacy_cfg.read_text())
+        print("Migrated settings from the pre-release omarchy-argb.")
+
+    write_file(SYSTEMD_USER_DIR / SERVER_UNIT, (
+        "[Unit]\nDescription=OpenRGB SDK server\n\n"
+        f"[Service]\nExecStart={openrgb} --server --noautoconnect\nRestart=on-failure\n\n"
+        "[Install]\nWantedBy=default.target\n"))
+    write_file(SYSTEMD_USER_DIR / ENGINE_UNIT, (
+        "[Unit]\nDescription=omarchy-prism lighting engine\n"
+        f"After={SERVER_UNIT}\nWants={SERVER_UNIT}\n\n"
+        f"[Service]\nExecStart={py} {SCRIPT} engine\nRestart=always\nRestartSec=2\n"
+        "RestartPreventExitStatus=78\n\n"
+        "[Install]\nWantedBy=default.target\n"))
+
+    BIN_LINK.parent.mkdir(parents=True, exist_ok=True)
+    if BIN_LINK.is_symlink() or BIN_LINK.exists():
+        BIN_LINK.unlink()
+    BIN_LINK.symlink_to(SCRIPT)
+
+    write_file(HOOK_FILE, (
+        "#!/bin/bash\n\n"
+        "# Recolor ARGB lighting to the new theme's accent (only when \"Match theme\" is on).\n"
+        f"exec \"{SCRIPT}\" theme-hook \"$@\"\n"), mode=0o755)
+
+    systemctl("daemon-reload")
+    systemctl("enable", SERVER_UNIT, ENGINE_UNIT)
+    systemctl("restart", SERVER_UNIT)
+    systemctl("restart", ENGINE_UNIT)
+    time.sleep(4)  # device detection
+    print()
+    print_checks(doctor_checks())
+    if str(BIN_LINK.parent) not in os.environ.get("PATH", "").split(":"):
+        print(f"\nnote: {BIN_LINK.parent} is not in PATH; call the CLI as {SCRIPT}")
+
+
+def cmd_uninstall(args):
+    for unit in (ENGINE_UNIT, SERVER_UNIT, *LEGACY_UNITS):
+        systemctl("disable", "--now", unit, check=False)
+        p = SYSTEMD_USER_DIR / unit
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    systemctl("daemon-reload", check=False)
+    for p in (HOOK_FILE, BIN_LINK):
+        if p.is_symlink() or p.exists():
+            p.unlink()
+    if args.purge:
+        for d in (CONFIG_DIR, STATE_DIR, DATA_DIR):
+            shutil.rmtree(d, ignore_errors=True)
+    print("Removed services, hook and CLI link" + (" and all settings." if args.purge else
+          f" (settings kept in {CONFIG_DIR}; use --purge to delete them)."))
+
+
+# --------------------------------------------------------------------------
+# Commands
+# --------------------------------------------------------------------------
+
+def warn_if_engine_down():
+    if service_state(ENGINE_UNIT) != "active":
+        print("warning: the lighting engine isn't running; run `omarchy-prism setup`", file=sys.stderr)
+
+
+def cmd_status(args):
+    st = build_status()
+    if args.json:
+        print(json.dumps(st))
+        return
+    cfg, rt = st["config"], st["runtime"]
+    print(f"power:      {'on' if cfg['power'] else 'off'}"
+          + (f" (paused: {rt['suppressed']})" if rt.get("suppressed") else ""))
+    print(f"mode:       {cfg['mode']}")
+    print(f"color:      #{cfg['color']}")
+    print(f"brightness: {cfg['brightness']}%")
+    print(f"speed:      {cfg['speed']}%")
+    print(f"theme sync: {'on' if cfg['follow_theme'] else 'off'}")
+    print(f"auto-off:   lock={'on' if cfg['auto_off']['lock'] else 'off'} "
+          f"screensaver={'on' if cfg['auto_off']['screensaver'] else 'off'}")
+    print(f"engine:     {st['engine']}    server: {st['server']}    devices: {len(rt.get('devices', []))}")
+
+
+def cmd_devices(_args):
+    rt = read_runtime()
+    if not rt.get("devices"):
+        raise UserError("no devices known; is the engine running? (omarchy-prism doctor)")
+    for dev in rt["devices"]:
+        print(f"{dev.get('name', '?')}  [{dev.get('type', '?')}, {dev.get('leds', '?')} LEDs]")
+        for z in dev.get("zones", []):
+            size = f"{z['leds']} LEDs" + (f", resizable {z['min']}-{z['max']}" if z["resizable"] else "")
+            print(f"    {z['name']}: {size}")
+
+
+def cmd_doctor(args):
+    checks = doctor_checks()
+    if args.json:
+        print(json.dumps(checks))
+    else:
+        print_checks(checks)
+    return 1 if any(c["status"] == "fail" for c in checks) else 0
+
+
+def cmd_color(args):
+    if args.value == "theme":
+        hexv = theme_accent()
+        if not hexv:
+            raise UserError("no theme accent found")
+    else:
+        hexv = normalize_hex(args.value)
+
+    def mutate(cfg):
+        cfg["color"], cfg["power"] = hexv, True
+        if cfg["mode"] in SELF_COLORED:
+            cfg["mode"] = "Static"
+    update_config(mutate)
+    warn_if_engine_down()
+
+
+def cmd_mode(args):
+    mode = normalize_mode(args.name)
+
+    def mutate(cfg):
+        cfg["mode"], cfg["power"] = mode, True
+    update_config(mutate)
+    warn_if_engine_down()
+
+
+def number_arg(value, name):
+    if not re.fullmatch(r"\d+", str(value)) or not 0 <= int(value) <= 100:
+        raise UserError(f"{name} must be 0-100")
+    return int(value)
+
+
+def cmd_brightness(args):
+    n = number_arg(args.value, "brightness")
+
+    def mutate(cfg):
+        cfg["brightness"] = n
+        if n > 0:
+            cfg["power"] = True
+    update_config(mutate)
+    warn_if_engine_down()
+
+
+def cmd_speed(args):
+    n = number_arg(args.value, "speed")
+    update_config(lambda cfg: cfg.update(speed=n))
+    warn_if_engine_down()
+
+
+def cmd_power(args):
+    def mutate(cfg):
+        cfg["power"] = (not cfg["power"]) if args.action == "toggle" else args.action == "on"
+    update_config(mutate)
+    warn_if_engine_down()
+
+
+def cmd_follow(args):
+    on = args.state == "on"
+    hexv = theme_accent() if on else ""
+
+    def mutate(cfg):
+        cfg["follow_theme"] = on
+        if on and hexv:
+            cfg["color"] = hexv
+            if cfg["mode"] in SELF_COLORED:
+                cfg["mode"] = "Static"
+    update_config(mutate)
+
+
+def cmd_auto_off(args):
+    update_config(lambda cfg: cfg["auto_off"].update({args.trigger: args.state == "on"}))
+
+
+def cmd_theme_hook(_args):
+    if not load_config()["follow_theme"]:
+        return
+    hexv = theme_accent()
+    if hexv:
+        update_config(lambda cfg: cfg.update(color=hexv))
+
+
+def resolve_zone(query, devices):
+    """Find the one resizable zone matching `query` (exact key or substring)."""
+    zones = [z for d in devices for z in d["zones"] if z["resizable"]]
+    exact = [z for z in zones if z["key"] == query]
+    if exact:
+        return exact[0]
+    q = query.lower()
+    hits = [z for z in zones if q in z["key"].lower()]
+    if len(hits) == 1:
+        return hits[0]
+    if not hits:
+        raise UserError(f"no resizable zone matches '{query}' (see: omarchy-prism devices)")
+    raise UserError(f"'{query}' is ambiguous: " + ", ".join(z["name"] for z in hits))
+
+
+def cmd_zone(args):
+    zone = resolve_zone(args.zone, read_runtime().get("devices", []))
+    if not re.fullmatch(r"\d+", args.leds):
+        raise UserError("LED count must be a whole number")
+    n = clamp(int(args.leds), zone["min"], zone["max"])
+    update_config(lambda cfg: cfg["zones"].__setitem__(zone["key"], n))
+    print(f"{zone['key']}: {n} LEDs")
+
+
+def cmd_engine(_args):
+    Engine().run()
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="omarchy-prism", description="Control ARGB/RGB lighting via OpenRGB.")
+    p.add_argument("--version", action="version", version=f"omarchy-prism {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("status", help="show current settings")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_status)
+
+    sub.add_parser("devices", help="list detected devices and zones").set_defaults(fn=cmd_devices)
+
+    s = sub.add_parser("doctor", help="diagnose installation problems")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_doctor)
+
+    s = sub.add_parser("color", help="set the color: hex, a name, or 'theme'")
+    s.add_argument("value")
+    s.set_defaults(fn=cmd_color)
+
+    s = sub.add_parser("mode", help="set the effect: " + ", ".join(MODES))
+    s.add_argument("name")
+    s.set_defaults(fn=cmd_mode)
+
+    for name, fn in (("brightness", cmd_brightness), ("speed", cmd_speed)):
+        s = sub.add_parser(name, help=f"set {name} (0-100)")
+        s.add_argument("value")
+        s.set_defaults(fn=fn)
+
+    for action in ("on", "off", "toggle"):
+        s = sub.add_parser(action, help=f"turn the lights {action}" if action != "toggle" else "toggle power")
+        s.set_defaults(fn=cmd_power, action=action)
+
+    s = sub.add_parser("follow", help="recolor to the theme accent when the theme changes")
+    s.add_argument("state", choices=["on", "off"])
+    s.set_defaults(fn=cmd_follow)
+
+    s = sub.add_parser("auto-off", help="turn lights off while the screen is locked / screensaver runs")
+    s.add_argument("trigger", choices=["lock", "screensaver"])
+    s.add_argument("state", choices=["on", "off"])
+    s.set_defaults(fn=cmd_auto_off)
+
+    s = sub.add_parser("zone", help="set the LED count of an addressable header")
+    s.add_argument("zone", help="zone name or part of it, e.g. 'Header 1'")
+    s.add_argument("leds")
+    s.set_defaults(fn=cmd_zone)
+
+    sub.add_parser("setup", help="install OpenRGB deps, services and the theme hook").set_defaults(fn=cmd_setup)
+    s = sub.add_parser("uninstall", help="remove services, hook and CLI link")
+    s.add_argument("--purge", action="store_true", help="also delete settings and the Python environment")
+    s.set_defaults(fn=cmd_uninstall)
+
+    sub.add_parser("theme-hook", help=argparse.SUPPRESS).set_defaults(fn=cmd_theme_hook)
+    sub.add_parser("engine", help=argparse.SUPPRESS).set_defaults(fn=cmd_engine)
+    return p
+
+
+def main(argv=None):
+    args, extra = build_parser().parse_known_args(argv)
+    if extra and args.cmd != "theme-hook":  # the theme hook is passed the theme name
+        build_parser().error(f"unrecognized arguments: {' '.join(extra)}")
+    try:
+        return args.fn(args) or 0
+    except UserError as e:
+        print(f"omarchy-prism: {e}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
