@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "jram0421.prism",
   "name": "Prism",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "author": "jram0421",
   "license": "MIT",
   "description": "Control your PC's RGB lighting from the Omarchy bar. Sets motherboard headers, RAM, LED strips and fans to one color or a synced effect, matches your theme's accent, and turns off when the screen locks. Powered by OpenRGB.",

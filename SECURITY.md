@@ -12,7 +12,9 @@ helpers) and never listens on the network itself.
 
 - **OpenRGB server.** The OpenRGB SDK has **no authentication**, so anything that can reach
   its port can control your devices. Prism's service starts it with
-  `--server-host 127.0.0.1` (loopback only) when your OpenRGB supports that flag. If you
+  `--server-host 127.0.0.1` (loopback only). OpenRGB versions without that flag (0.8 and older)
+  listen on every interface by default, so `setup` refuses to start the server for them and
+  asks you to update OpenRGB; `doctor` also fails if port 6742 is reachable from other hosts. If you
   already have your own `openrgb-server.service`, Prism leaves it alone, so make sure yours
   binds to `127.0.0.1` too. Check with `ss -ltn | grep 6742`.
 - **Other local users.** On a shared machine, other local accounts can still connect to

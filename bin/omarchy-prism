@@ -29,7 +29,7 @@ import threading
 import time
 from pathlib import Path
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 OPENRGB_LIB = "openrgb-python==0.3.8"
 # Pure-Python wheel with no dependencies; the hash is the digest PyPI publishes for it.
 OPENRGB_LIB_SHA256 = "6e61a92a2119c7cdab4e615302a0707cd8d8f12e3f001067a6b5fae0c5e7e7b2"
@@ -562,6 +562,11 @@ def doctor_checks():
         add(label, "ok" if state == "active" else "fail", state,
             "" if state == "active" else f"systemctl --user restart {unit}  (or: omarchy-prism setup)")
 
+    exposed = exposed_sdk_listeners()
+    if exposed:
+        add("SDK port not exposed", "fail", "port 6742 listens on " + ", ".join(exposed),
+            "restart OpenRGB with --server-host 127.0.0.1; the SDK has no authentication")
+
     rt = read_runtime()
     if rt.get("connected"):
         n = len(rt.get("devices", []))
@@ -571,6 +576,18 @@ def doctor_checks():
         add("Devices detected", "fail", rt.get("error") or "engine not connected", "journalctl --user -u omarchy-prism")
 
     return checks
+
+
+def exposed_sdk_listeners(port=6742):
+    """Local addresses where the OpenRGB SDK port accepts non-loopback connections."""
+    r = run(["ss", "-ltnH", f"sport = :{port}"])
+    found = []
+    for line in (r.stdout.splitlines() if r else []):
+        cols = line.split()
+        addr = cols[3] if len(cols) > 3 else ""
+        if addr and not addr.startswith(("127.", "[::1]")):
+            found.append(addr)
+    return found
 
 
 def print_checks(checks):
@@ -620,11 +637,11 @@ def supports_server_host(openrgb):
     return bool(r and "--server-host" in (r.stdout + r.stderr))
 
 
-def render_server_unit(openrgb, bind_local):
-    # Bind to loopback explicitly where supported: the SDK has no authentication.
-    flags = " --server-host 127.0.0.1" if bind_local else ""
+def render_server_unit(openrgb):
+    # Always bind to loopback: the SDK has no authentication, and OpenRGB's default
+    # is every interface. Callers must have checked supports_server_host() first.
     return (f"{MANAGED}\n[Unit]\nDescription=OpenRGB SDK server\n\n"
-            f"[Service]\nExecStart={unit_quote(openrgb)} --server{flags} --noautoconnect\n"
+            f"[Service]\nExecStart={unit_quote(openrgb)} --server --server-host 127.0.0.1 --noautoconnect\n"
             "Restart=on-failure\n\n[Install]\nWantedBy=default.target\n")
 
 
@@ -699,7 +716,14 @@ def cmd_setup(_args):
 
     server_unit = SYSTEMD_USER_DIR / SERVER_UNIT
     if is_ours(server_unit, (MANAGED, SERVER_UNIT_V0)):
-        write_file(server_unit, render_server_unit(openrgb, supports_server_host(openrgb)))
+        if not supports_server_host(openrgb):
+            # Fail closed: this OpenRGB would listen on 0.0.0.0 with no authentication.
+            systemctl("disable", "--now", SERVER_UNIT, check=False)
+            server_unit.unlink(missing_ok=True)
+            raise UserError("this OpenRGB has no --server-host option, so its unauthenticated SDK server "
+                            "would listen on every network interface. Prism will not start it. Update OpenRGB "
+                            "(0.9 or newer, or the git build) and run `omarchy-prism setup` again.")
+        write_file(server_unit, render_server_unit(openrgb))
     else:
         print(f"note: keeping your existing {SERVER_UNIT} (not created by Prism). "
               "Make sure it runs `openrgb --server` and listens on 127.0.0.1 only; the SDK has no authentication.")

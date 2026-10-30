@@ -29,7 +29,7 @@ through playful phrases while the lights are on.
 ## Requirements
 
 - Omarchy (the shell plugin system), Python 3.9+
-- [OpenRGB](https://openrgb.org) (tested with 1.1; `setup` installs it for you on Arch)
+- [OpenRGB](https://openrgb.org) 0.9 or newer (tested with 1.1; `setup` installs it for you on Arch). Older versions can't be limited to localhost, so `setup` refuses to start them.
 - Hardware that OpenRGB supports. Check the
   [supported devices list](https://openrgb.org/devices_0.9.html).
   Developed and tested on an ASUS TUF GAMING B650-E WIFI (Aura USB controller) with ENE DRAM

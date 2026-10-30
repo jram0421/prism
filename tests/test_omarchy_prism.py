@@ -360,12 +360,25 @@ class SecurityTests(IsolatedConfig):
         engine = prism.render_engine_unit("/py thon/bin/python", "/odd %dir/bin/omarchy-prism")
         self.assertIn(prism.MANAGED, engine)
         self.assertIn('ExecStart="/py thon/bin/python" "/odd %%dir/bin/omarchy-prism" engine', engine)
-        server = prism.render_server_unit("/usr/bin/openrgb", True)
+        server = prism.render_server_unit("/usr/bin/openrgb")
         self.assertIn(prism.MANAGED, server)
         self.assertIn('--server --server-host 127.0.0.1 --noautoconnect', server)
 
-    def test_server_binds_to_loopback_only_when_supported(self):
-        self.assertNotIn("--server-host", prism.render_server_unit("/usr/bin/openrgb", False))
+    def test_server_unit_always_binds_loopback(self):
+        self.assertIn("--server-host 127.0.0.1", prism.render_server_unit("/usr/bin/openrgb"))
+
+    def test_setup_refuses_openrgb_without_server_host(self):
+        # OpenRGB 0.8 has no --server-host and listens on 0.0.0.0: never start it.
+        src = (ROOT / "bin/omarchy-prism").read_text()
+        body = src.split("def cmd_setup", 1)[1].split("systemctl(\"daemon-reload\")", 1)[0]
+        self.assertIn("if not supports_server_host(openrgb):", body)
+        self.assertLess(body.index("supports_server_host"), body.index("write_file(server_unit"))
+
+    def test_exposed_listener_detection(self):
+        from unittest import mock
+        out = "LISTEN 0 128 0.0.0.0:6742 0.0.0.0:*\nLISTEN 0 128 127.0.0.1:6742 0.0.0.0:*\nLISTEN 0 1 [::1]:6742 [::]:*\n"
+        with mock.patch.object(prism, "run", return_value=mock.Mock(stdout=out)):
+            self.assertEqual(prism.exposed_sdk_listeners(), ["0.0.0.0:6742"])
 
     def test_units_pass_systemd_analyze_when_available(self):
         import shutil, subprocess

@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.0.3
+
+- Security: `setup` no longer starts the OpenRGB server when the installed OpenRGB has no
+  `--server-host` option (0.8 and older bind the unauthenticated SDK to every interface). It
+  removes Prism's server unit and asks you to update OpenRGB instead. The server is now always
+  started with `--server-host 127.0.0.1`.
+- `doctor` fails if port 6742 is listening on a non-loopback address.
+
 ## 1.0.2
 
 - Safe removal: if the plugin is removed with `omarchy plugin remove` without running
